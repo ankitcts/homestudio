@@ -1,4 +1,13 @@
-# Generated at build time by build.js from .env / deployment env vars.
-config.js
-
+# dependencies
 node_modules/
+
+# next.js
+.next/
+out/
+
+# misc
+.DS_Store
+*.pem
+
+# local env overrides (the committed .env holds the shared key)
+.env*.local

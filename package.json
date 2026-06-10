@@ -2,8 +2,17 @@
   "name": "homestudio",
   "version": "1.0.0",
   "private": true,
-  "description": "Home Studio — roof/footprint measurement with 3D view",
+  "description": "Home Studio — roof/footprint measurement with 3D view (Next.js)",
   "scripts": {
-    "build": "node build.js"
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "next": "^14.2.35",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "three": "0.160.0"
   }
 }
