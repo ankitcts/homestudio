@@ -55,7 +55,7 @@ const MARKUP = `
         <div class="tabs" id="mode-tabs">
           <div class="tab active" data-mode="solar">Roof from imagery</div>
           <div class="tab" data-mode="draw">Draw roof outline</div>
-          <div class="tab" data-mode="auto">Auto footprint (OSM)</div>
+          <div class="tab" data-mode="auto">Auto footprint (buildings)</div>
         </div>
 
         <div id="mode-hint" class="hint"></div>
@@ -306,7 +306,7 @@ export default function Page() {
       const hints = {
         solar: "Pulls roof segment polygons, pitch and area from aerial imagery + a surface model (Google building dataset). Best source for a roof-replacement estimate.",
         draw: "Trace the roof/footprint outline on the satellite image. Area & perimeter are computed geodesically as you draw.",
-        auto: "Fetches the nearest OpenStreetMap building footprint automatically — free, no key required. Good for siding perimeter.",
+        auto: "Fetches the building footprint automatically from Microsoft Building Footprints (falls back to OpenStreetMap). Good for siding perimeter and the 3D footprint overlay.",
       };
       $("mode-hint").textContent = hints[mode] || "";
     }
@@ -346,7 +346,7 @@ export default function Page() {
       const cached = p.results?.[mode];
       if (!cached) return false;
       p.report = cached.report; p.geometry = cached.geometry;
-      renderReport(p.report); draw3D(p.geometry);
+      renderReport(p.report); draw3D(p.geometry); updateTilesOverlay(p);
       return true;
     }
 
@@ -358,7 +358,7 @@ export default function Page() {
       if (mode === "auto") {
         if (!apiKey()) { $("map").innerHTML = '<div class="empty" style="padding:60px 0;">Auto footprint uses OpenStreetMap (no map tiles without a key). It will fetch automatically.</div>'; }
         const loaded = !!p.results?.auto;
-        $("map-controls").appendChild(mkBtn(loaded ? "Reload OSM footprint" : "Fetch OSM footprint", fetchOsmFootprint));
+        $("map-controls").appendChild(mkBtn(loaded ? "Reload building footprint" : "Fetch building footprint", fetchOsmFootprint));
         if (apiKey()) await ensureMap(p);
         if (loaded) showMode(p); else fetchOsmFootprint();
         return;
@@ -471,6 +471,7 @@ export default function Page() {
         saveProjects();
         renderReport(report);
         draw3D(p.geometry);
+        updateTilesOverlay(p);
       } catch (e) {
         setError("Roof imagery: " + e.message + ". Try drawing the roof, or use OSM footprint.");
       } finally {
@@ -518,6 +519,7 @@ export default function Page() {
       saveProjects();
       renderReport(report);
       draw3D(p.geometry);
+      updateTilesOverlay(p);
     }
 
     // -----------------------------------------------------------------------
@@ -527,36 +529,30 @@ export default function Page() {
       const p = active(); if (!p) return;
       setError(""); const btn = $("map-controls").firstChild; btn.disabled = true; btn.textContent = "Fetching…";
       try {
-        const r = await fetch(`/api/osm?lat=${p.lat}&lng=${p.lng}`);
+        const r = await fetch(`/api/footprint?lat=${p.lat}&lng=${p.lng}`);
         const j = await r.json();
         if (j.error) throw new Error(j.error);
-        const ways = (j.elements || []).filter(e => e.type === "way" && e.geometry && e.geometry.length >= 4);
-        if (!ways.length) throw new Error("No OSM building found within 40 m of this point.");
-        let best = null, bestD = Infinity;
-        for (const w of ways) {
-          const ring = w.geometry.map(n => [n.lat, n.lon]);
-          const c = centroid(ring);
-          const d = (c[0]-p.lat)**2 + (c[1]-p.lng)**2;
-          if (d < bestD) { bestD = d; best = ring; }
-        }
-        const area = geodesicArea(best);
-        const perim = geodesicPerimeter(best);
-        const report = { source: "OpenStreetMap footprint", roofArea_m2: area, footprint_m2: area, perimeter_m: perim, vertices: best.length };
+        const ring = j.ring;
+        if (!ring || ring.length < 3) throw new Error("No building footprint returned.");
+        const area = geodesicArea(ring);
+        const perim = geodesicPerimeter(ring);
+        const report = { source: j.source || "Building footprint", roofArea_m2: area, footprint_m2: area, perimeter_m: perim, vertices: ring.length };
         p.report = report;
-        p.geometry = { polys: [{ ring: best, color: "#4ade80", pitch: 0, area }], center: [p.lat, p.lng] };
+        p.geometry = { polys: [{ ring, color: "#4ade80", pitch: 0, area }], center: [p.lat, p.lng] };
         p.results = p.results || {}; p.results.auto = { report, geometry: p.geometry };
         saveProjects();
         renderReport(report);
         draw3D(p.geometry);
+        updateTilesOverlay(p);
         if (mapReady && window.google?.maps) {
           clearRoof();
-          const poly = new google.maps.Polygon({ paths: best.map(r => ({ lat: r[0], lng: r[1] })), map, strokeColor: "#4ade80", fillColor: "#4ade80", fillOpacity: 0.25, strokeWeight: 2 });
+          const poly = new google.maps.Polygon({ paths: ring.map(rr => ({ lat: rr[0], lng: rr[1] })), map, strokeColor: "#4ade80", fillColor: "#4ade80", fillOpacity: 0.25, strokeWeight: 2 });
           roofPolys.push(poly);
         }
       } catch (e) {
-        setError("OSM footprint: " + e.message);
+        setError("Building footprint: " + e.message);
       } finally {
-        btn.disabled = false; btn.textContent = "Fetch OSM footprint";
+        btn.disabled = false; btn.textContent = active()?.results?.auto ? "Reload building footprint" : "Fetch building footprint";
       }
     }
 
@@ -770,7 +766,7 @@ export default function Page() {
     // -----------------------------------------------------------------------
     // Photorealistic 3D — Google Photorealistic 3D Maps (Map3DElement)
     // -----------------------------------------------------------------------
-    let map3d = null, map3dRotate = null, tilesKey = null;
+    let map3d = null, map3dRotate = null, tilesKey = null, tilesOverlays = [];
 
     function disposeTiles() {
       if (map3dRotate) { clearInterval(map3dRotate); map3dRotate = null; }
@@ -809,10 +805,44 @@ export default function Page() {
         wrap.innerHTML = "";
         wrap.appendChild(map3d);
         status.textContent = "";
+        updateTilesOverlay(p);
       } catch (e) {
         status.textContent = "3D Maps error: " + e.message;
         disposeTiles();
       }
+    }
+
+    // Draw the measured footprint + dimension labels onto the real 3D map.
+    async function updateTilesOverlay(p) {
+      if (!map3d || !p?.geometry?.polys?.length) return;
+      let lib;
+      try { lib = await google.maps.importLibrary("maps3d"); } catch { return; }
+      const { Polygon3DElement, Marker3DElement, AltitudeMode } = lib;
+      tilesOverlays.forEach((o) => { try { o.remove(); } catch {} });
+      tilesOverlays = [];
+      try {
+        p.geometry.polys.forEach((poly) => {
+          if (Polygon3DElement) {
+            const pg = new Polygon3DElement({
+              altitudeMode: AltitudeMode ? AltitudeMode.CLAMP_TO_GROUND : undefined,
+              strokeColor: "#4ade80", strokeWidth: 3, fillColor: "rgba(110,168,254,0.20)",
+            });
+            pg.outerCoordinates = poly.ring.map(([lat, lng]) => ({ lat, lng }));
+            map3d.append(pg); tilesOverlays.push(pg);
+          }
+          if (Marker3DElement) {
+            let cx = 0, cy = 0; poly.ring.forEach(([lat, lng]) => { cx += lat; cy += lng; });
+            cx /= poly.ring.length; cy /= poly.ring.length;
+            const ft2 = Math.round((poly.area || 0) * 10.7639).toLocaleString();
+            const mk = new Marker3DElement({
+              position: { lat: cx, lng: cy, altitude: 18 },
+              altitudeMode: AltitudeMode ? AltitudeMode.RELATIVE_TO_GROUND : undefined,
+              label: `${ft2} ft²`,
+            });
+            map3d.append(mk); tilesOverlays.push(mk);
+          }
+        });
+      } catch { /* overlay element API mismatch — skip gracefully */ }
     }
 
     // Zoom / auto-rotate / reset / fullscreen for the 3D Maps panel (wired once).
