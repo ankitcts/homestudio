@@ -1,59 +1,76 @@
 # GroundedSAM roof-segmentation endpoint for Home Studio's /api/segment route.
 #
-# Deploy this as a Hugging Face Space (SDK: Gradio, GPU recommended) OR adapt it
-# to a dedicated Inference Endpoint. Then set in Vercel:
-#   HF_SEGMENT_URL        = https://<your-space>.hf.space/segment   (this route)
-#   HUGGINGFACE_API_TOKEN = your HF token
+# Pipeline: Grounding DINO (open-vocab detection of "roof") -> SAM (masks for the
+# detected boxes) -> largest external contour -> polygon in image-pixel coords.
 #
-# Contract expected by /api/segment:
-#   POST JSON { "image_base64": "<png/jpg base64>", "prompt": "roof" }
-#   ->  JSON { "polygon": [[x, y], ...], "width": W, "height": H }
-#        polygon = largest roof contour, in image pixel coordinates.
+# Contract (matches app/api/segment/route.js):
+#   POST /segment  JSON { "image_base64": "<base64>", "prompt": "roof" }
+#     -> { "polygon": [[x, y], ...], "width": W, "height": H }
 #
-# This template uses Grounding DINO (open-vocab detection) + SAM (segmentation),
-# i.e. "GroundedSAM". Swap in GroundedSAM 2 / your own weights as needed.
+# Deploy as a Hugging Face **Docker** Space (GPU recommended). The public Space
+# URL's /segment path becomes HF_SEGMENT_URL in Vercel, e.g.
+#   https://ankitcts-homestudio-roof-segmenter.hf.space/segment
 
 import base64
 import io
-import json
 
-import numpy as np
 import cv2
+import numpy as np
+import torch
 from PIL import Image
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from transformers import (
+    AutoModelForZeroShotObjectDetection,
+    AutoProcessor,
+    SamModel,
+    SamProcessor,
+)
 
-# --- Load your models once at startup (pseudo-wired; install the real deps) ---
-# from groundingdino.util.inference import load_model, predict
-# from segment_anything import sam_model_registry, SamPredictor
-# dino = load_model(...); sam = SamPredictor(sam_model_registry["vit_h"](checkpoint=...))
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DINO_ID = "IDEA-Research/grounding-dino-tiny"
+SAM_ID = "facebook/sam-vit-base"
+
+dino_processor = AutoProcessor.from_pretrained(DINO_ID)
+dino = AutoModelForZeroShotObjectDetection.from_pretrained(DINO_ID).to(DEVICE)
+sam = SamModel.from_pretrained(SAM_ID).to(DEVICE)
+sam_processor = SamProcessor.from_pretrained(SAM_ID)
 
 app = FastAPI()
 
 
-def segment_roof(image: np.ndarray, prompt: str = "roof"):
-    """Return the largest roof contour as a list of [x, y] pixel points.
+def detect_boxes(image, prompt):
+    text = prompt.strip()
+    if not text.endswith("."):
+        text += "."
+    inputs = dino_processor(images=image, text=text, return_tensors="pt").to(DEVICE)
+    with torch.no_grad():
+        outputs = dino(**inputs)
+    results = dino_processor.post_process_grounded_object_detection(
+        outputs, inputs.input_ids, box_threshold=0.25, text_threshold=0.25,
+        target_sizes=[image.size[::-1]],
+    )
+    return results[0]["boxes"].cpu().numpy().tolist()
 
-    Replace the body with your GroundedSAM inference. The reference flow:
-      1. boxes = grounding_dino(image, text=prompt)
-      2. masks = sam(image, boxes)          # boolean HxW mask(s)
-      3. union the masks, take the largest external contour
-    Below is the contour-extraction step given a boolean `mask`.
-    """
-    # mask = run_grounded_sam(image, prompt)  # -> HxW bool
-    # --- placeholder so the Space boots; returns the image bounding box ---
-    h, w = image.shape[:2]
-    mask = np.zeros((h, w), dtype=np.uint8)
-    mask[h // 4 : 3 * h // 4, w // 4 : 3 * w // 4] = 1  # TODO: real mask
 
-    contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return [], w, h
-    c = max(contours, key=cv2.contourArea)
-    eps = 0.01 * cv2.arcLength(c, True)
-    approx = cv2.approxPolyDP(c, eps, True)
-    poly = [[int(p[0][0]), int(p[0][1])] for p in approx]
-    return poly, w, h
+def union_mask(image, boxes):
+    if not boxes:
+        return None
+    inputs = sam_processor(image, input_boxes=[boxes], return_tensors="pt").to(DEVICE)
+    with torch.no_grad():
+        outputs = sam(**inputs)
+    masks = sam_processor.image_processor.post_process_masks(
+        outputs.pred_masks.cpu(), inputs["original_sizes"].cpu(), inputs["reshaped_input_sizes"].cpu()
+    )[0].numpy()  # (num_boxes, masks_per_box, H, W)
+    union = np.zeros(masks.shape[-2:], dtype=bool)
+    for b in range(masks.shape[0]):
+        union |= masks[b, 0]
+    return union
+
+
+@app.get("/")
+def health():
+    return {"status": "ok", "device": DEVICE}
 
 
 @app.post("/segment")
@@ -63,6 +80,20 @@ async def segment(request: Request):
     prompt = body.get("prompt", "roof")
     if not b64:
         return JSONResponse({"error": "image_base64 required"}, status_code=400)
-    img = np.array(Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB"))
-    poly, w, h = segment_roof(img, prompt)
-    return {"polygon": poly, "width": w, "height": h}
+    image = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
+    w, h = image.size
+    try:
+        boxes = detect_boxes(image, prompt)
+        mask = union_mask(image, boxes)
+        if mask is None:
+            return {"polygon": [], "width": w, "height": h}
+        contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return {"polygon": [], "width": w, "height": h}
+        c = max(contours, key=cv2.contourArea)
+        eps = 0.01 * cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, eps, True)
+        poly = [[int(p[0][0]), int(p[0][1])] for p in approx]
+        return {"polygon": poly, "width": w, "height": h}
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"error": str(e)}, status_code=500)
