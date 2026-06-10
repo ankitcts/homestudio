@@ -82,8 +82,10 @@ const MARKUP = `
             <div id="report-body" style="margin-top:12px;"><div class="empty">No measurement yet.</div></div>
           </div>
           <div class="panel">
-            <h3>Photorealistic 3D · Google Map Tiles</h3>
-            <canvas id="tiles3d"></canvas>
+            <h3>Photorealistic 3D · Google Map Tiles
+              <button class="ghost" id="t-full" title="Fullscreen" style="float:right;padding:4px 9px;">⛶ Fullscreen</button>
+            </h3>
+            <div id="tiles-wrap"><canvas id="tiles3d"></canvas></div>
             <div class="row" style="margin-top:8px;gap:6px;">
               <button class="ghost" id="t-zoom-in">＋ Zoom in</button>
               <button class="ghost" id="t-zoom-out">－ Zoom out</button>
@@ -91,7 +93,7 @@ const MARKUP = `
               <button class="ghost" id="t-reset">⤢ Reset view</button>
             </div>
             <div class="hint" id="tiles-status">Locate an address to load the real 3D building.</div>
-            <div class="hint">Drag to rotate · scroll or buttons to zoom · centered on the located home.</div>
+            <div class="hint">Left-drag to orbit · right-drag to pan · scroll or buttons to zoom · centered on the located home.</div>
           </div>
         </div>
       </div>
@@ -323,16 +325,26 @@ export default function Page() {
     // -----------------------------------------------------------------------
     let gmapsPromise = null;
     function loadGoogleMaps() {
-      if (window.google?.maps) return Promise.resolve();
       if (gmapsPromise) return gmapsPromise;
       if (!apiKey()) return Promise.reject(new Error("No Google API key set."));
       gmapsPromise = new Promise((resolve, reject) => {
+        if (window.google?.maps?.importLibrary) return resolve();
         window.__gmapsCb = () => resolve();
         const s = document.createElement("script");
-        s.src = `https://maps.googleapis.com/maps/api/js?key=${apiKey()}&libraries=geometry,drawing,places,marker&loading=async&callback=__gmapsCb`;
+        s.src = `https://maps.googleapis.com/maps/api/js?key=${apiKey()}&v=weekly&libraries=geometry,drawing,places,marker&loading=async&callback=__gmapsCb`;
         s.async = true; s.onerror = () => reject(new Error("Failed to load Google Maps JS."));
         document.head.appendChild(s);
-      });
+      })
+        // With loading=async the namespaces must be imported before use,
+        // otherwise google.maps.drawing/geometry/marker are undefined.
+        .then(() => Promise.all([
+          google.maps.importLibrary("maps"),
+          google.maps.importLibrary("drawing"),
+          google.maps.importLibrary("geometry"),
+          google.maps.importLibrary("marker"),
+          google.maps.importLibrary("places"),
+        ]))
+        .then(() => {});
       return gmapsPromise;
     }
 
@@ -767,6 +779,21 @@ export default function Page() {
       $("t-zoom-out")?.addEventListener("click", () => zoom(1.25));
       $("t-rotate")?.addEventListener("click", (e) => { if (!tControls) return; tControls.autoRotate = !tControls.autoRotate; e.currentTarget.textContent = tControls.autoRotate ? "⟳ Stop rotate" : "⟳ Auto-rotate"; });
       $("t-reset")?.addEventListener("click", () => { if (!tCamera || !tControls) return; tCamera.position.set(0, 170, 210); tControls.target.set(0, 12, 0); tControls.update(); });
+
+      const wrap = $("tiles-wrap");
+      $("t-full")?.addEventListener("click", () => {
+        if (!document.fullscreenElement) wrap?.requestFullscreen?.();
+        else document.exitFullscreen?.();
+      });
+      const resizeTiles = () => {
+        if (!tRenderer || !tCamera) return;
+        const full = document.fullscreenElement === wrap;
+        const w = wrap.clientWidth || 400;
+        const h = full ? (wrap.clientHeight || 360) : 360;
+        tRenderer.setSize(w, h, false);
+        tCamera.aspect = w / h; tCamera.updateProjectionMatrix();
+      };
+      document.addEventListener("fullscreenchange", resizeTiles);
     }
 
     function initTiles(p) {
