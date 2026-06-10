@@ -84,8 +84,14 @@ const MARKUP = `
           <div class="panel">
             <h3>Photorealistic 3D · Google Map Tiles</h3>
             <canvas id="tiles3d"></canvas>
+            <div class="row" style="margin-top:8px;gap:6px;">
+              <button class="ghost" id="t-zoom-in">＋ Zoom in</button>
+              <button class="ghost" id="t-zoom-out">－ Zoom out</button>
+              <button class="ghost" id="t-rotate">⟳ Auto-rotate</button>
+              <button class="ghost" id="t-reset">⤢ Reset view</button>
+            </div>
             <div class="hint" id="tiles-status">Locate an address to load the real 3D building.</div>
-            <div class="hint">Drag to orbit · scroll to zoom. Real textured mesh from Google Map Tiles.</div>
+            <div class="hint">Drag to rotate · scroll or buttons to zoom · centered on the located home.</div>
           </div>
         </div>
       </div>
@@ -428,7 +434,7 @@ export default function Page() {
               const poly = new google.maps.Polygon({ paths: path, map, strokeColor: COLORS[i % COLORS.length], strokeWeight: 2, fillColor: COLORS[i % COLORS.length], fillOpacity: 0.25 });
               roofPolys.push(poly);
             }
-            geomPolys.push({ ring: path.map(pt => [pt.lat, pt.lng]), color: COLORS[i % COLORS.length], pitch: s.pitchDegrees || 0, azimuth: s.azimuthDegrees || 0, area });
+            geomPolys.push({ ring: path.map(pt => [pt.lat, pt.lng]), color: COLORS[i % COLORS.length], pitch: s.pitchDegrees || 0, azimuth: s.azimuthDegrees || 0, area, planeHeight: s.planeHeightAtCenterMeters ?? null });
           }
         });
         const whole = sp.wholeRoofStats?.areaMeters2 ?? totalArea;
@@ -679,33 +685,51 @@ export default function Page() {
 
       const wallMat = new THREE.MeshStandardMaterial({ color: 0x8a8f99, roughness: 0.9, metalness: 0, transparent: true, opacity: 0.85, side: THREE.DoubleSide });
 
+      // Common ground reference so multi-level roofs sit at their real relative heights.
+      let minPH = Infinity;
+      geometry.polys.forEach(p => { if (p.planeHeight != null) minPH = Math.min(minPH, p.planeHeight); });
+      if (!isFinite(minPH)) minPH = 0;
+
+      const allX = [], allZ = [];
       const legendItems = [];
       geometry.polys.forEach((poly, idx) => {
-        const corners = poly.ring.slice(0, 4).map(toXZ);
-        if (corners.length < 4) return;
-        const pitch = toRad(poly.pitch || 0);
-        const az = toRad(poly.azimuth || 0);
-        // downslope direction in (x,z): compass azimuth -> east=sin, north=cos (north=-z)
-        const d = { x: Math.sin(az), z: -Math.cos(az) };
-        const slopes = corners.map(c => -(c.x * d.x + c.z * d.z) * Math.tan(pitch));
-        const minS = Math.min(...slopes);
-        // Roof top corners sit on the walls (wallM) and tilt up by the slope.
-        const top = corners.map((c, i) => new THREE.Vector3(c.x, wallM + (slopes[i] - minS), c.z));
-        const bottom = top.map(v => new THREE.Vector3(v.x, v.y - ROOF_T, v.z));
-
+        const corners = poly.ring.map(toXZ);
+        corners.forEach(c => { allX.push(c.x); allZ.push(c.z); });
         const color = new THREE.Color(poly.color || "#6ea8fe");
-        const roofGeo = makeBox(top, bottom);
-        const roof = new THREE.Mesh(roofGeo, new THREE.MeshStandardMaterial({ color, roughness: 0.85, metalness: 0.05, side: THREE.DoubleSide, flatShading: true }));
-        buildingGroup.add(roof);
-        buildingGroup.add(new THREE.LineSegments(new THREE.EdgesGeometry(roofGeo), new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.3 })));
+        const pitch = toRad(poly.pitch || 0);
+        const segBase = wallM + ((poly.planeHeight != null ? poly.planeHeight : minPH) - minPH);
 
-        // Walls (siding) under the eave, from ground to wall height.
-        const wallTop = corners.map(c => new THREE.Vector3(c.x, wallM, c.z));
-        const wallBottom = corners.map(c => new THREE.Vector3(c.x, 0, c.z));
-        buildingGroup.add(new THREE.Mesh(makeBox(wallTop, wallBottom), wallMat));
-
+        if (corners.length === 4 && pitch > 0.001) {
+          // Pitched segment: tilt the quad about its centroid along the downslope.
+          const az = toRad(poly.azimuth || 0);
+          const d = { x: Math.sin(az), z: -Math.cos(az) };
+          const cx = (corners[0].x + corners[1].x + corners[2].x + corners[3].x) / 4;
+          const cz = (corners[0].z + corners[1].z + corners[2].z + corners[3].z) / 4;
+          const top = corners.map(c => new THREE.Vector3(c.x, segBase - ((c.x - cx) * d.x + (c.z - cz) * d.z) * Math.tan(pitch), c.z));
+          const bottom = top.map(v => new THREE.Vector3(v.x, v.y - ROOF_T, v.z));
+          const roofGeo = makeBox(top, bottom);
+          buildingGroup.add(new THREE.Mesh(roofGeo, new THREE.MeshStandardMaterial({ color, roughness: 0.85, metalness: 0.05, side: THREE.DoubleSide, flatShading: true })));
+          buildingGroup.add(new THREE.LineSegments(new THREE.EdgesGeometry(roofGeo), new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.3 })));
+        } else {
+          // Flat cap: show the true footprint/segment polygon at the wall height.
+          const shape = new THREE.Shape(corners.map(c => new THREE.Vector2(c.x, c.z)));
+          const capGeo = new THREE.ShapeGeometry(shape);
+          capGeo.rotateX(Math.PI / 2); capGeo.translate(0, segBase, 0);
+          buildingGroup.add(new THREE.Mesh(capGeo, new THREE.MeshStandardMaterial({ color, roughness: 0.85, side: THREE.DoubleSide })));
+          buildingGroup.add(new THREE.LineSegments(new THREE.EdgesGeometry(capGeo), new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.3 })));
+        }
         legendItems.push({ color: poly.color || "#6ea8fe", label: geometry.polys.length > 1 ? `Seg ${idx + 1} · ${fmt(poly.area * M2_TO_FT2)} ft²` : `${fmt(poly.area * M2_TO_FT2)} ft²` });
       });
+
+      // One clean wall mass (union footprint of all segments) from ground to eave.
+      if (allX.length) {
+        const minx = Math.min(...allX), maxx = Math.max(...allX), minz = Math.min(...allZ), maxz = Math.max(...allZ);
+        const wt = [
+          new THREE.Vector3(minx, wallM, minz), new THREE.Vector3(maxx, wallM, minz),
+          new THREE.Vector3(maxx, wallM, maxz), new THREE.Vector3(minx, wallM, maxz),
+        ];
+        buildingGroup.add(new THREE.Mesh(makeBox(wt, wt.map(v => new THREE.Vector3(v.x, 0, v.z))), wallMat));
+      }
 
       // Ground plane for context
       const gp = new THREE.Mesh(new THREE.PlaneGeometry(400, 400), new THREE.MeshStandardMaterial({ color: 0x12151c, roughness: 1 }));
@@ -736,6 +760,15 @@ export default function Page() {
       tilesKey = null;
     }
 
+    // Zoom / auto-rotate / reset buttons for the Map Tiles panel (wired once).
+    function wireTilesControls() {
+      const zoom = (alpha) => { if (!tCamera || !tControls) return; tCamera.position.lerpVectors(tControls.target, tCamera.position, alpha); tControls.update(); };
+      $("t-zoom-in")?.addEventListener("click", () => zoom(0.8));
+      $("t-zoom-out")?.addEventListener("click", () => zoom(1.25));
+      $("t-rotate")?.addEventListener("click", (e) => { if (!tControls) return; tControls.autoRotate = !tControls.autoRotate; e.currentTarget.textContent = tControls.autoRotate ? "⟳ Stop rotate" : "⟳ Auto-rotate"; });
+      $("t-reset")?.addEventListener("click", () => { if (!tCamera || !tControls) return; tCamera.position.set(0, 170, 210); tControls.target.set(0, 12, 0); tControls.update(); });
+    }
+
     function initTiles(p) {
       const status = $("tiles-status");
       if (!mapsKey) { status.textContent = "Add a Google key with the Map Tiles API enabled to see the real 3D building."; return; }
@@ -752,11 +785,15 @@ export default function Page() {
         tRenderer.setPixelRatio(Math.min(devicePixelRatio, 2));
         tScene = new THREE.Scene();
         tScene.background = new THREE.Color(0x0b0d11);
-        tCamera = new THREE.PerspectiveCamera(60, w / h, 1, 6000);
-        tCamera.position.set(120, 90, 120);
+        tCamera = new THREE.PerspectiveCamera(55, w / h, 1, 8000);
+        tCamera.position.set(0, 170, 210);
         tControls = new OrbitControls(tCamera, canvas);
         tControls.enableDamping = true;
-        tControls.target.set(0, 0, 0);
+        tControls.target.set(0, 12, 0);
+        tControls.minDistance = 35;
+        tControls.maxDistance = 1500;
+        tControls.maxPolarAngle = Math.PI * 0.49; // stay above ground
+        tControls.autoRotateSpeed = 0.8;
         tScene.add(new THREE.HemisphereLight(0xffffff, 0x404050, 2.2));
         const dl = new THREE.DirectionalLight(0xffffff, 2.0); dl.position.set(1, 2, 1); tScene.add(dl);
 
@@ -817,6 +854,7 @@ export default function Page() {
       if (ks) ks.textContent = mapsKey
         ? "Server key configured — autocomplete, imagery, Solar & Map Tiles enabled."
         : "No server key set. OSM footprint still works; add GOOGLE_SOLAR_API_KEY to .env for the rest.";
+      wireTilesControls();
       if (!activeId && projects.length) activeId = projects[0].id;
       renderProjects();
       renderProjectView();
