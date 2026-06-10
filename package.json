@@ -1,0 +1,9 @@
+{
+  "name": "homestudio",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Home Studio — roof/footprint measurement with 3D view",
+  "scripts": {
+    "build": "node build.js"
+  }
+}
