@@ -46,10 +46,16 @@ def detect_boxes(image, prompt):
     inputs = dino_processor(images=image, text=text, return_tensors="pt").to(DEVICE)
     with torch.no_grad():
         outputs = dino(**inputs)
-    results = dino_processor.post_process_grounded_object_detection(
-        outputs, inputs.input_ids, box_threshold=0.25, text_threshold=0.25,
-        target_sizes=[image.size[::-1]],
-    )
+    target_sizes = [image.size[::-1]]
+    # transformers renamed box_threshold -> threshold; support both.
+    try:
+        results = dino_processor.post_process_grounded_object_detection(
+            outputs, inputs.input_ids, threshold=0.25, text_threshold=0.25, target_sizes=target_sizes,
+        )
+    except TypeError:
+        results = dino_processor.post_process_grounded_object_detection(
+            outputs, inputs.input_ids, box_threshold=0.25, text_threshold=0.25, target_sizes=target_sizes,
+        )
     return results[0]["boxes"].cpu().numpy().tolist()
 
 
