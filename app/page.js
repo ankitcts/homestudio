@@ -353,6 +353,7 @@ export default function Page() {
     async function initMapForMode() {
       const p = active(); if (!p || p.lat == null) return;
       $("map-controls").innerHTML = "";
+      initTiles(p); // load the real Google 3D home view in every mode (incl. OSM)
 
       if (mode === "auto") {
         if (!apiKey()) { $("map").innerHTML = '<div class="empty" style="padding:60px 0;">Auto footprint uses OpenStreetMap (no map tiles without a key). It will fetch automatically.</div>'; }
@@ -796,8 +797,8 @@ export default function Page() {
       try {
         map3d = new Map3DElement({
           center: { lat: p.lat, lng: p.lng, altitude: 0 },
-          range: 220,        // distance from the home (m)
-          tilt: 67.5,        // look down at an angle
+          range: 120,        // close enough to frame the whole house (m)
+          tilt: 60,          // look down at an angle
           heading: 0,
           mode: Map3DMode ? Map3DMode.HYBRID : undefined,
         });
