@@ -52,12 +52,13 @@ const MARKUP = `
       <div id="project-view" style="display:none;">
         <div class="panel">
           <h3>Address</h3>
+          <div id="addr-ac-mount" style="margin-bottom:8px;"></div>
           <div class="row">
-            <input type="text" id="addr-input" placeholder="Start typing an address…" autocomplete="off" style="flex:1;min-width:280px;" />
+            <input type="text" id="addr-input" placeholder="…or type an address and click Locate" autocomplete="off" style="flex:1;min-width:280px;" />
             <button id="geocode-btn">Locate</button>
             <span class="status" id="geo-status"></span>
           </div>
-          <div class="hint">Suggestions appear as you type (Google Places). Pick one to drop the pin automatically.</div>
+          <div class="hint">Use the search box above for autocomplete (Google Places), or type an address and click Locate.</div>
         </div>
 
         <div class="tabs" id="mode-tabs">
@@ -125,6 +126,7 @@ export default function Page() {
     let activeId = store.getActiveId();
     let mode = "solar";
     let mapsKey = ""; // fetched from the server (/api/maps-key)
+    let mapId = "";   // optional Google Map ID (enables Advanced Markers)
 
     function saveProjects() { store.saveProjects(projects); }
     function active() { return projects.find(p => p.id === activeId) || null; }
@@ -226,27 +228,41 @@ export default function Page() {
     // -----------------------------------------------------------------------
     // Address: Google Places autocomplete + manual geocode (server proxy)
     // -----------------------------------------------------------------------
-    let autocomplete = null;
-    function setupAutocomplete() {
-      if (autocomplete || !window.google?.maps?.places) return;
-      autocomplete = new google.maps.places.Autocomplete($("addr-input"), {
-        fields: ["formatted_address", "geometry"],
-        types: ["address"],
-      });
-      autocomplete.addListener("place_changed", () => {
-        const place = autocomplete.getPlace();
-        const p = active();
-        if (!p || !place.geometry) return;
-        p.lat = place.geometry.location.lat();
-        p.lng = place.geometry.location.lng();
-        p.address = place.formatted_address || $("addr-input").value;
-        saveProjects();
-        $("addr-input").value = p.address;
-        $("geo-status").textContent = `📍 ${p.lat.toFixed(6)}, ${p.lng.toFixed(6)}`;
-        renderProjects();
-        initMapForMode();
-        initTiles(p);
-      });
+    // New Places API (PlaceAutocompleteElement). Uses "Places API (New)".
+    let autocompleteEl = null;
+    async function setupAutocomplete() {
+      if (autocompleteEl || !window.google?.maps?.importLibrary) return;
+      let placesLib;
+      try { placesLib = await google.maps.importLibrary("places"); } catch { return; }
+      const PAE = placesLib.PlaceAutocompleteElement || window.google.maps.places?.PlaceAutocompleteElement;
+      if (!PAE) return;
+      const mount = $("addr-ac-mount");
+      if (!mount) return;
+      try { autocompleteEl = new PAE(); } catch { return; }
+      mount.innerHTML = "";
+      mount.appendChild(autocompleteEl);
+
+      const onSelect = async (ev) => {
+        const p = active(); if (!p) return;
+        try {
+          const pred = ev.placePrediction || ev.detail?.placePrediction;
+          const place = pred ? pred.toPlace() : (ev.place || ev.detail?.place);
+          if (!place) return;
+          await place.fetchFields({ fields: ["formattedAddress", "location"] });
+          p.lat = place.location.lat();
+          p.lng = place.location.lng();
+          p.address = place.formattedAddress || p.address;
+          saveProjects();
+          $("addr-input").value = p.address;
+          $("geo-status").textContent = `📍 ${p.lat.toFixed(6)}, ${p.lng.toFixed(6)}`;
+          renderProjects();
+          initMapForMode();
+          initTiles(p);
+        } catch (e) { setError("Address lookup failed: " + e.message); }
+      };
+      // Event name has shifted across releases — listen for both.
+      autocompleteEl.addEventListener("gmp-select", onSelect);
+      autocompleteEl.addEventListener("gmp-placeselect", onSelect);
     }
 
     $("geocode-btn").addEventListener("click", geocode);
@@ -307,14 +323,14 @@ export default function Page() {
       gmapsPromise = new Promise((resolve, reject) => {
         window.__gmapsCb = () => resolve();
         const s = document.createElement("script");
-        s.src = `https://maps.googleapis.com/maps/api/js?key=${apiKey()}&libraries=geometry,drawing,places&callback=__gmapsCb`;
+        s.src = `https://maps.googleapis.com/maps/api/js?key=${apiKey()}&libraries=geometry,drawing,places,marker&loading=async&callback=__gmapsCb`;
         s.async = true; s.onerror = () => reject(new Error("Failed to load Google Maps JS."));
         document.head.appendChild(s);
       });
       return gmapsPromise;
     }
 
-    let map = null, mapReady = false, drawnPoly = null, drawingManager = null, roofPolys = [];
+    let map = null, mapReady = false, drawnPoly = null, drawingManager = null, roofPolys = [], centerMarker = null;
 
     async function initMapForMode() {
       const p = active(); if (!p || p.lat == null) return;
@@ -345,16 +361,28 @@ export default function Page() {
       const el = $("map");
       if (!map || el.dataset.kind !== "gmap") {
         el.innerHTML = ""; el.dataset.kind = "gmap";
-        map = new google.maps.Map(el, {
+        const opts = {
           center: { lat: p.lat, lng: p.lng }, zoom: 20, mapTypeId: "satellite",
           tilt: 0, disableDefaultUI: false, mapTypeControl: false, streetViewControl: false,
-        });
+        };
+        if (mapId) opts.mapId = mapId;
+        map = new google.maps.Map(el, opts);
       } else {
         map.setCenter({ lat: p.lat, lng: p.lng });
       }
       mapReady = true;
       clearRoof();
-      new google.maps.Marker({ position: { lat: p.lat, lng: p.lng }, map });
+      setCenterMarker({ lat: p.lat, lng: p.lng });
+    }
+
+    // Advanced Markers need a Map ID; fall back to the classic Marker otherwise.
+    function setCenterMarker(position) {
+      if (centerMarker) { try { centerMarker.setMap?.(null); centerMarker.map = null; } catch {} centerMarker = null; }
+      if (mapId && google.maps.marker?.AdvancedMarkerElement) {
+        centerMarker = new google.maps.marker.AdvancedMarkerElement({ map, position });
+      } else {
+        centerMarker = new google.maps.Marker({ position, map });
+      }
     }
 
     function mkBtn(label, fn, ghost) {
@@ -783,6 +811,7 @@ export default function Page() {
         const r = await fetch("/api/maps-key");
         const j = await r.json();
         mapsKey = (j.key || "").trim();
+        mapId = (j.mapId || "").trim();
       } catch { /* OSM mode still works */ }
       const ks = $("key-status");
       if (ks) ks.textContent = mapsKey

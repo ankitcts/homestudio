@@ -7,5 +7,7 @@ export const dynamic = "force-dynamic";
 
 export async function GET() {
   const key = (process.env.GOOGLE_SOLAR_API_KEY || "").trim();
-  return Response.json({ key });
+  // Optional Map ID — enables Advanced Markers (otherwise the classic Marker is used).
+  const mapId = (process.env.GOOGLE_MAP_ID || "").trim();
+  return Response.json({ key, mapId });
 }
