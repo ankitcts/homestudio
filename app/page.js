@@ -52,12 +52,13 @@ const MARKUP = `
       <div id="project-view" style="display:none;">
         <div class="panel">
           <h3>Address</h3>
+          <div id="addr-ac-mount" style="margin-bottom:8px;"></div>
           <div class="row">
-            <input type="text" id="addr-input" placeholder="Start typing an address…" autocomplete="off" style="flex:1;min-width:280px;" />
+            <input type="text" id="addr-input" placeholder="…or type an address and click Locate" autocomplete="off" style="flex:1;min-width:280px;" />
             <button id="geocode-btn">Locate</button>
             <span class="status" id="geo-status"></span>
           </div>
-          <div class="hint">Suggestions appear as you type (Google Places). Pick one to drop the pin automatically.</div>
+          <div class="hint">Use the search box above for autocomplete (Google Places), or type an address and click Locate.</div>
         </div>
 
         <div class="tabs" id="mode-tabs">
@@ -83,8 +84,14 @@ const MARKUP = `
           <div class="panel">
             <h3>Photorealistic 3D · Google Map Tiles</h3>
             <canvas id="tiles3d"></canvas>
+            <div class="row" style="margin-top:8px;gap:6px;">
+              <button class="ghost" id="t-zoom-in">＋ Zoom in</button>
+              <button class="ghost" id="t-zoom-out">－ Zoom out</button>
+              <button class="ghost" id="t-rotate">⟳ Auto-rotate</button>
+              <button class="ghost" id="t-reset">⤢ Reset view</button>
+            </div>
             <div class="hint" id="tiles-status">Locate an address to load the real 3D building.</div>
-            <div class="hint">Drag to orbit · scroll to zoom. Real textured mesh from Google Map Tiles.</div>
+            <div class="hint">Drag to rotate · scroll or buttons to zoom · centered on the located home.</div>
           </div>
         </div>
       </div>
@@ -125,6 +132,7 @@ export default function Page() {
     let activeId = store.getActiveId();
     let mode = "solar";
     let mapsKey = ""; // fetched from the server (/api/maps-key)
+    let mapId = "";   // optional Google Map ID (enables Advanced Markers)
 
     function saveProjects() { store.saveProjects(projects); }
     function active() { return projects.find(p => p.id === activeId) || null; }
@@ -226,27 +234,41 @@ export default function Page() {
     // -----------------------------------------------------------------------
     // Address: Google Places autocomplete + manual geocode (server proxy)
     // -----------------------------------------------------------------------
-    let autocomplete = null;
-    function setupAutocomplete() {
-      if (autocomplete || !window.google?.maps?.places) return;
-      autocomplete = new google.maps.places.Autocomplete($("addr-input"), {
-        fields: ["formatted_address", "geometry"],
-        types: ["address"],
-      });
-      autocomplete.addListener("place_changed", () => {
-        const place = autocomplete.getPlace();
-        const p = active();
-        if (!p || !place.geometry) return;
-        p.lat = place.geometry.location.lat();
-        p.lng = place.geometry.location.lng();
-        p.address = place.formatted_address || $("addr-input").value;
-        saveProjects();
-        $("addr-input").value = p.address;
-        $("geo-status").textContent = `📍 ${p.lat.toFixed(6)}, ${p.lng.toFixed(6)}`;
-        renderProjects();
-        initMapForMode();
-        initTiles(p);
-      });
+    // New Places API (PlaceAutocompleteElement). Uses "Places API (New)".
+    let autocompleteEl = null;
+    async function setupAutocomplete() {
+      if (autocompleteEl || !window.google?.maps?.importLibrary) return;
+      let placesLib;
+      try { placesLib = await google.maps.importLibrary("places"); } catch { return; }
+      const PAE = placesLib.PlaceAutocompleteElement || window.google.maps.places?.PlaceAutocompleteElement;
+      if (!PAE) return;
+      const mount = $("addr-ac-mount");
+      if (!mount) return;
+      try { autocompleteEl = new PAE(); } catch { return; }
+      mount.innerHTML = "";
+      mount.appendChild(autocompleteEl);
+
+      const onSelect = async (ev) => {
+        const p = active(); if (!p) return;
+        try {
+          const pred = ev.placePrediction || ev.detail?.placePrediction;
+          const place = pred ? pred.toPlace() : (ev.place || ev.detail?.place);
+          if (!place) return;
+          await place.fetchFields({ fields: ["formattedAddress", "location"] });
+          p.lat = place.location.lat();
+          p.lng = place.location.lng();
+          p.address = place.formattedAddress || p.address;
+          saveProjects();
+          $("addr-input").value = p.address;
+          $("geo-status").textContent = `📍 ${p.lat.toFixed(6)}, ${p.lng.toFixed(6)}`;
+          renderProjects();
+          initMapForMode();
+          initTiles(p);
+        } catch (e) { setError("Address lookup failed: " + e.message); }
+      };
+      // Event name has shifted across releases — listen for both.
+      autocompleteEl.addEventListener("gmp-select", onSelect);
+      autocompleteEl.addEventListener("gmp-placeselect", onSelect);
     }
 
     $("geocode-btn").addEventListener("click", geocode);
@@ -307,14 +329,14 @@ export default function Page() {
       gmapsPromise = new Promise((resolve, reject) => {
         window.__gmapsCb = () => resolve();
         const s = document.createElement("script");
-        s.src = `https://maps.googleapis.com/maps/api/js?key=${apiKey()}&libraries=geometry,drawing,places&callback=__gmapsCb`;
+        s.src = `https://maps.googleapis.com/maps/api/js?key=${apiKey()}&libraries=geometry,drawing,places,marker&loading=async&callback=__gmapsCb`;
         s.async = true; s.onerror = () => reject(new Error("Failed to load Google Maps JS."));
         document.head.appendChild(s);
       });
       return gmapsPromise;
     }
 
-    let map = null, mapReady = false, drawnPoly = null, drawingManager = null, roofPolys = [];
+    let map = null, mapReady = false, drawnPoly = null, drawingManager = null, roofPolys = [], centerMarker = null;
 
     async function initMapForMode() {
       const p = active(); if (!p || p.lat == null) return;
@@ -345,16 +367,28 @@ export default function Page() {
       const el = $("map");
       if (!map || el.dataset.kind !== "gmap") {
         el.innerHTML = ""; el.dataset.kind = "gmap";
-        map = new google.maps.Map(el, {
+        const opts = {
           center: { lat: p.lat, lng: p.lng }, zoom: 20, mapTypeId: "satellite",
           tilt: 0, disableDefaultUI: false, mapTypeControl: false, streetViewControl: false,
-        });
+        };
+        if (mapId) opts.mapId = mapId;
+        map = new google.maps.Map(el, opts);
       } else {
         map.setCenter({ lat: p.lat, lng: p.lng });
       }
       mapReady = true;
       clearRoof();
-      new google.maps.Marker({ position: { lat: p.lat, lng: p.lng }, map });
+      setCenterMarker({ lat: p.lat, lng: p.lng });
+    }
+
+    // Advanced Markers need a Map ID; fall back to the classic Marker otherwise.
+    function setCenterMarker(position) {
+      if (centerMarker) { try { centerMarker.setMap?.(null); centerMarker.map = null; } catch {} centerMarker = null; }
+      if (mapId && google.maps.marker?.AdvancedMarkerElement) {
+        centerMarker = new google.maps.marker.AdvancedMarkerElement({ map, position });
+      } else {
+        centerMarker = new google.maps.Marker({ position, map });
+      }
     }
 
     function mkBtn(label, fn, ghost) {
@@ -400,7 +434,7 @@ export default function Page() {
               const poly = new google.maps.Polygon({ paths: path, map, strokeColor: COLORS[i % COLORS.length], strokeWeight: 2, fillColor: COLORS[i % COLORS.length], fillOpacity: 0.25 });
               roofPolys.push(poly);
             }
-            geomPolys.push({ ring: path.map(pt => [pt.lat, pt.lng]), color: COLORS[i % COLORS.length], pitch: s.pitchDegrees || 0, azimuth: s.azimuthDegrees || 0, area });
+            geomPolys.push({ ring: path.map(pt => [pt.lat, pt.lng]), color: COLORS[i % COLORS.length], pitch: s.pitchDegrees || 0, azimuth: s.azimuthDegrees || 0, area, planeHeight: s.planeHeightAtCenterMeters ?? null });
           }
         });
         const whole = sp.wholeRoofStats?.areaMeters2 ?? totalArea;
@@ -651,33 +685,51 @@ export default function Page() {
 
       const wallMat = new THREE.MeshStandardMaterial({ color: 0x8a8f99, roughness: 0.9, metalness: 0, transparent: true, opacity: 0.85, side: THREE.DoubleSide });
 
+      // Common ground reference so multi-level roofs sit at their real relative heights.
+      let minPH = Infinity;
+      geometry.polys.forEach(p => { if (p.planeHeight != null) minPH = Math.min(minPH, p.planeHeight); });
+      if (!isFinite(minPH)) minPH = 0;
+
+      const allX = [], allZ = [];
       const legendItems = [];
       geometry.polys.forEach((poly, idx) => {
-        const corners = poly.ring.slice(0, 4).map(toXZ);
-        if (corners.length < 4) return;
-        const pitch = toRad(poly.pitch || 0);
-        const az = toRad(poly.azimuth || 0);
-        // downslope direction in (x,z): compass azimuth -> east=sin, north=cos (north=-z)
-        const d = { x: Math.sin(az), z: -Math.cos(az) };
-        const slopes = corners.map(c => -(c.x * d.x + c.z * d.z) * Math.tan(pitch));
-        const minS = Math.min(...slopes);
-        // Roof top corners sit on the walls (wallM) and tilt up by the slope.
-        const top = corners.map((c, i) => new THREE.Vector3(c.x, wallM + (slopes[i] - minS), c.z));
-        const bottom = top.map(v => new THREE.Vector3(v.x, v.y - ROOF_T, v.z));
-
+        const corners = poly.ring.map(toXZ);
+        corners.forEach(c => { allX.push(c.x); allZ.push(c.z); });
         const color = new THREE.Color(poly.color || "#6ea8fe");
-        const roofGeo = makeBox(top, bottom);
-        const roof = new THREE.Mesh(roofGeo, new THREE.MeshStandardMaterial({ color, roughness: 0.85, metalness: 0.05, side: THREE.DoubleSide, flatShading: true }));
-        buildingGroup.add(roof);
-        buildingGroup.add(new THREE.LineSegments(new THREE.EdgesGeometry(roofGeo), new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.3 })));
+        const pitch = toRad(poly.pitch || 0);
+        const segBase = wallM + ((poly.planeHeight != null ? poly.planeHeight : minPH) - minPH);
 
-        // Walls (siding) under the eave, from ground to wall height.
-        const wallTop = corners.map(c => new THREE.Vector3(c.x, wallM, c.z));
-        const wallBottom = corners.map(c => new THREE.Vector3(c.x, 0, c.z));
-        buildingGroup.add(new THREE.Mesh(makeBox(wallTop, wallBottom), wallMat));
-
+        if (corners.length === 4 && pitch > 0.001) {
+          // Pitched segment: tilt the quad about its centroid along the downslope.
+          const az = toRad(poly.azimuth || 0);
+          const d = { x: Math.sin(az), z: -Math.cos(az) };
+          const cx = (corners[0].x + corners[1].x + corners[2].x + corners[3].x) / 4;
+          const cz = (corners[0].z + corners[1].z + corners[2].z + corners[3].z) / 4;
+          const top = corners.map(c => new THREE.Vector3(c.x, segBase - ((c.x - cx) * d.x + (c.z - cz) * d.z) * Math.tan(pitch), c.z));
+          const bottom = top.map(v => new THREE.Vector3(v.x, v.y - ROOF_T, v.z));
+          const roofGeo = makeBox(top, bottom);
+          buildingGroup.add(new THREE.Mesh(roofGeo, new THREE.MeshStandardMaterial({ color, roughness: 0.85, metalness: 0.05, side: THREE.DoubleSide, flatShading: true })));
+          buildingGroup.add(new THREE.LineSegments(new THREE.EdgesGeometry(roofGeo), new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.3 })));
+        } else {
+          // Flat cap: show the true footprint/segment polygon at the wall height.
+          const shape = new THREE.Shape(corners.map(c => new THREE.Vector2(c.x, c.z)));
+          const capGeo = new THREE.ShapeGeometry(shape);
+          capGeo.rotateX(Math.PI / 2); capGeo.translate(0, segBase, 0);
+          buildingGroup.add(new THREE.Mesh(capGeo, new THREE.MeshStandardMaterial({ color, roughness: 0.85, side: THREE.DoubleSide })));
+          buildingGroup.add(new THREE.LineSegments(new THREE.EdgesGeometry(capGeo), new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.3 })));
+        }
         legendItems.push({ color: poly.color || "#6ea8fe", label: geometry.polys.length > 1 ? `Seg ${idx + 1} · ${fmt(poly.area * M2_TO_FT2)} ft²` : `${fmt(poly.area * M2_TO_FT2)} ft²` });
       });
+
+      // One clean wall mass (union footprint of all segments) from ground to eave.
+      if (allX.length) {
+        const minx = Math.min(...allX), maxx = Math.max(...allX), minz = Math.min(...allZ), maxz = Math.max(...allZ);
+        const wt = [
+          new THREE.Vector3(minx, wallM, minz), new THREE.Vector3(maxx, wallM, minz),
+          new THREE.Vector3(maxx, wallM, maxz), new THREE.Vector3(minx, wallM, maxz),
+        ];
+        buildingGroup.add(new THREE.Mesh(makeBox(wt, wt.map(v => new THREE.Vector3(v.x, 0, v.z))), wallMat));
+      }
 
       // Ground plane for context
       const gp = new THREE.Mesh(new THREE.PlaneGeometry(400, 400), new THREE.MeshStandardMaterial({ color: 0x12151c, roughness: 1 }));
@@ -708,6 +760,15 @@ export default function Page() {
       tilesKey = null;
     }
 
+    // Zoom / auto-rotate / reset buttons for the Map Tiles panel (wired once).
+    function wireTilesControls() {
+      const zoom = (alpha) => { if (!tCamera || !tControls) return; tCamera.position.lerpVectors(tControls.target, tCamera.position, alpha); tControls.update(); };
+      $("t-zoom-in")?.addEventListener("click", () => zoom(0.8));
+      $("t-zoom-out")?.addEventListener("click", () => zoom(1.25));
+      $("t-rotate")?.addEventListener("click", (e) => { if (!tControls) return; tControls.autoRotate = !tControls.autoRotate; e.currentTarget.textContent = tControls.autoRotate ? "⟳ Stop rotate" : "⟳ Auto-rotate"; });
+      $("t-reset")?.addEventListener("click", () => { if (!tCamera || !tControls) return; tCamera.position.set(0, 170, 210); tControls.target.set(0, 12, 0); tControls.update(); });
+    }
+
     function initTiles(p) {
       const status = $("tiles-status");
       if (!mapsKey) { status.textContent = "Add a Google key with the Map Tiles API enabled to see the real 3D building."; return; }
@@ -724,11 +785,15 @@ export default function Page() {
         tRenderer.setPixelRatio(Math.min(devicePixelRatio, 2));
         tScene = new THREE.Scene();
         tScene.background = new THREE.Color(0x0b0d11);
-        tCamera = new THREE.PerspectiveCamera(60, w / h, 1, 6000);
-        tCamera.position.set(120, 90, 120);
+        tCamera = new THREE.PerspectiveCamera(55, w / h, 1, 8000);
+        tCamera.position.set(0, 170, 210);
         tControls = new OrbitControls(tCamera, canvas);
         tControls.enableDamping = true;
-        tControls.target.set(0, 0, 0);
+        tControls.target.set(0, 12, 0);
+        tControls.minDistance = 35;
+        tControls.maxDistance = 1500;
+        tControls.maxPolarAngle = Math.PI * 0.49; // stay above ground
+        tControls.autoRotateSpeed = 0.8;
         tScene.add(new THREE.HemisphereLight(0xffffff, 0x404050, 2.2));
         const dl = new THREE.DirectionalLight(0xffffff, 2.0); dl.position.set(1, 2, 1); tScene.add(dl);
 
@@ -783,11 +848,13 @@ export default function Page() {
         const r = await fetch("/api/maps-key");
         const j = await r.json();
         mapsKey = (j.key || "").trim();
+        mapId = (j.mapId || "").trim();
       } catch { /* OSM mode still works */ }
       const ks = $("key-status");
       if (ks) ks.textContent = mapsKey
         ? "Server key configured — autocomplete, imagery, Solar & Map Tiles enabled."
         : "No server key set. OSM footprint still works; add GOOGLE_SOLAR_API_KEY to .env for the rest.";
+      wireTilesControls();
       if (!activeId && projects.length) activeId = projects[0].id;
       renderProjects();
       renderProjectView();
