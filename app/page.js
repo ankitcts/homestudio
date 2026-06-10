@@ -70,7 +70,7 @@ const MARKUP = `
             <canvas id="view3d"></canvas>
             <div class="legend" id="legend"></div>
             <div class="hint">Drag to orbit · scroll to zoom. Roof segments extruded for visualization.</div>
-            <div id="report-body" style="margin-top:12px;"><div class="empty">No measurement yet.</div></div>
+            <div id="report-body" class="report" style="margin-top:12px;"><div class="empty">No measurement yet.</div></div>
           </div>
           <div class="panel">
             <h3>Photorealistic 3D · Google Map Tiles
