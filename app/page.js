@@ -56,6 +56,7 @@ const MARKUP = `
           <div class="tab active" data-mode="solar">Roof from imagery</div>
           <div class="tab" data-mode="draw">Draw roof outline</div>
           <div class="tab" data-mode="auto">Auto footprint (buildings)</div>
+          <div class="tab" data-mode="ml">Roof (AI segment)</div>
         </div>
 
         <div id="mode-hint" class="hint"></div>
@@ -307,6 +308,7 @@ export default function Page() {
         solar: "Pulls roof segment polygons, pitch and area from aerial imagery + a surface model (Google building dataset). Best source for a roof-replacement estimate.",
         draw: "Trace the roof/footprint outline on the satellite image. Area & perimeter are computed geodesically as you draw.",
         auto: "Fetches the building footprint automatically from Microsoft Building Footprints (falls back to OpenStreetMap). Good for siding perimeter and the 3D footprint overlay.",
+        ml: "Segments the roof from the satellite image with an ML model (Hugging Face) and converts the pixels to real area. Requires HF_SEGMENT_URL + token configured.",
       };
       $("mode-hint").textContent = hints[mode] || "";
     }
@@ -375,6 +377,10 @@ export default function Page() {
         setupDrawing();
         $("map-controls").appendChild(mkBtn("Clear drawing", clearDrawing, true));
         showMode(p); // re-show a previous trace if one exists
+      } else if (mode === "ml") {
+        const loaded = !!p.results?.ml;
+        $("map-controls").appendChild(mkBtn(loaded ? "Reload AI roof" : "Segment roof (AI)", fetchMlSegment));
+        if (loaded) showMode(p); else fetchMlSegment();
       }
     }
 
@@ -553,6 +559,38 @@ export default function Page() {
         setError("Building footprint: " + e.message);
       } finally {
         btn.disabled = false; btn.textContent = active()?.results?.auto ? "Reload building footprint" : "Fetch building footprint";
+      }
+    }
+
+    // ML roof segmentation (server route /api/segment -> HF endpoint).
+    async function fetchMlSegment() {
+      const p = active(); if (!p) return;
+      setError(""); const btn = $("map-controls").firstChild; btn.disabled = true; btn.textContent = "Segmenting…";
+      try {
+        const r = await fetch(`/api/segment?lat=${p.lat}&lng=${p.lng}`);
+        const j = await r.json();
+        if (j.error) throw new Error(j.error);
+        const ring = j.ring;
+        if (!ring || ring.length < 3) throw new Error("No roof polygon returned.");
+        const area = geodesicArea(ring);
+        const perim = geodesicPerimeter(ring);
+        const report = { source: j.source || "ML roof segmentation", roofArea_m2: area, footprint_m2: area, perimeter_m: perim, vertices: ring.length };
+        p.report = report;
+        p.geometry = { polys: [{ ring, color: "#a78bfa", pitch: 0, area }], center: [p.lat, p.lng] };
+        p.results = p.results || {}; p.results.ml = { report, geometry: p.geometry };
+        saveProjects();
+        renderReport(report);
+        draw3D(p.geometry);
+        updateTilesOverlay(p);
+        if (mapReady && window.google?.maps) {
+          clearRoof();
+          const poly = new google.maps.Polygon({ paths: ring.map(rr => ({ lat: rr[0], lng: rr[1] })), map, strokeColor: "#a78bfa", fillColor: "#a78bfa", fillOpacity: 0.25, strokeWeight: 2 });
+          roofPolys.push(poly);
+        }
+      } catch (e) {
+        setError("AI roof: " + e.message);
+      } finally {
+        btn.disabled = false; btn.textContent = active()?.results?.ml ? "Reload AI roof" : "Segment roof (AI)";
       }
     }
 
