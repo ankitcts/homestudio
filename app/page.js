@@ -350,15 +350,25 @@ export default function Page() {
 
     let map = null, mapReady = false, drawnPoly = null, drawingManager = null, roofPolys = [], centerMarker = null;
 
+    // Render whatever result is cached for the active mode into the panels.
+    function showMode(p) {
+      const cached = p.results?.[mode];
+      if (!cached) return false;
+      p.report = cached.report; p.geometry = cached.geometry;
+      renderReport(p.report); draw3D(p.geometry);
+      return true;
+    }
+
     async function initMapForMode() {
       const p = active(); if (!p || p.lat == null) return;
       $("map-controls").innerHTML = "";
 
       if (mode === "auto") {
-        if (!apiKey()) { $("map").innerHTML = '<div class="empty" style="padding:60px 0;">Auto footprint uses OpenStreetMap (no map tiles without a key). Click below to fetch.</div>'; }
-        const btn = mkBtn("Fetch OSM footprint", fetchOsmFootprint);
-        $("map-controls").appendChild(btn);
+        if (!apiKey()) { $("map").innerHTML = '<div class="empty" style="padding:60px 0;">Auto footprint uses OpenStreetMap (no map tiles without a key). It will fetch automatically.</div>'; }
+        const loaded = !!p.results?.auto;
+        $("map-controls").appendChild(mkBtn(loaded ? "Reload OSM footprint" : "Fetch OSM footprint", fetchOsmFootprint));
         if (apiKey()) await ensureMap(p);
+        if (loaded) showMode(p); else fetchOsmFootprint();
         return;
       }
 
@@ -366,11 +376,13 @@ export default function Page() {
       await ensureMap(p);
 
       if (mode === "solar") {
-        const btn = mkBtn("Fetch roof segments", fetchSolar);
-        $("map-controls").appendChild(btn);
+        const loaded = !!p.results?.solar;
+        $("map-controls").appendChild(mkBtn(loaded ? "Reload roof segments" : "Fetch roof segments", fetchSolar));
+        if (loaded) showMode(p); else fetchSolar();
       } else if (mode === "draw") {
         setupDrawing();
         $("map-controls").appendChild(mkBtn("Clear drawing", clearDrawing, true));
+        showMode(p); // re-show a previous trace if one exists
       }
     }
 
@@ -463,6 +475,7 @@ export default function Page() {
         };
         p.report = report;
         p.geometry = { polys: geomPolys, center: [p.lat, p.lng] };
+        p.results = p.results || {}; p.results.solar = { report, geometry: p.geometry };
         saveProjects();
         renderReport(report);
         draw3D(p.geometry);
@@ -509,6 +522,7 @@ export default function Page() {
       const report = { source: "Manual trace", roofArea_m2: area, footprint_m2: area, perimeter_m: perim, vertices: ring.length };
       p.report = report;
       p.geometry = { polys: [{ ring, color: "#6ea8fe", pitch: 0, area }], center: [p.lat, p.lng] };
+      p.results = p.results || {}; p.results.draw = { report, geometry: p.geometry };
       saveProjects();
       renderReport(report);
       draw3D(p.geometry);
@@ -538,6 +552,7 @@ export default function Page() {
         const report = { source: "OpenStreetMap footprint", roofArea_m2: area, footprint_m2: area, perimeter_m: perim, vertices: best.length };
         p.report = report;
         p.geometry = { polys: [{ ring: best, color: "#4ade80", pitch: 0, area }], center: [p.lat, p.lng] };
+        p.results = p.results || {}; p.results.auto = { report, geometry: p.geometry };
         saveProjects();
         renderReport(report);
         draw3D(p.geometry);
