@@ -3,15 +3,6 @@
 import { useEffect, useRef } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import { DRACOLoader } from "three/examples/jsm/loaders/DRACOLoader.js";
-import { TilesRenderer } from "3d-tiles-renderer";
-import {
-  GoogleCloudAuthPlugin,
-  GLTFExtensionsPlugin,
-  TileCompressionPlugin,
-  TilesFadePlugin,
-  ReorientationPlugin,
-} from "3d-tiles-renderer/plugins";
 
 const MARKUP = `
   <div class="topbar">
@@ -85,7 +76,7 @@ const MARKUP = `
             <h3>Photorealistic 3D · Google Map Tiles
               <button class="ghost" id="t-full" title="Fullscreen" style="float:right;padding:4px 9px;">⛶ Fullscreen</button>
             </h3>
-            <div id="tiles-wrap"><canvas id="tiles3d"></canvas></div>
+            <div id="tiles-wrap"></div>
             <div class="row" style="margin-top:8px;gap:6px;">
               <button class="ghost" id="t-zoom-in">＋ Zoom in</button>
               <button class="ghost" id="t-zoom-out">－ Zoom out</button>
@@ -331,7 +322,7 @@ export default function Page() {
         if (window.google?.maps?.importLibrary) return resolve();
         window.__gmapsCb = () => resolve();
         const s = document.createElement("script");
-        s.src = `https://maps.googleapis.com/maps/api/js?key=${apiKey()}&v=weekly&libraries=geometry,drawing,places,marker&loading=async&callback=__gmapsCb`;
+        s.src = `https://maps.googleapis.com/maps/api/js?key=${apiKey()}&v=alpha&libraries=geometry,drawing,places,marker,maps3d&loading=async&callback=__gmapsCb`;
         s.async = true; s.onerror = () => reject(new Error("Failed to load Google Maps JS."));
         document.head.appendChild(s);
       })
@@ -776,98 +767,69 @@ export default function Page() {
     }
 
     // -----------------------------------------------------------------------
-    // Photorealistic 3D — Google Map Tiles (3d-tiles-renderer)
+    // Photorealistic 3D — Google Photorealistic 3D Maps (Map3DElement)
     // -----------------------------------------------------------------------
-    let tiles = null, tRenderer, tScene, tCamera, tControls, tRaf, tilesKey = null;
+    let map3d = null, map3dRotate = null, tilesKey = null;
+
     function disposeTiles() {
-      if (tRaf) { cancelAnimationFrame(tRaf); tRaf = null; }
-      if (tiles) { try { tiles.dispose(); } catch {} tiles = null; }
-      if (tRenderer) { try { tRenderer.dispose(); } catch {} }
-      tRenderer = tScene = tCamera = tControls = null;
+      if (map3dRotate) { clearInterval(map3dRotate); map3dRotate = null; }
+      if (map3d) { try { map3d.remove(); } catch {} map3d = null; }
       tilesKey = null;
     }
 
-    // Zoom / auto-rotate / reset buttons for the Map Tiles panel (wired once).
-    function wireTilesControls() {
-      const zoom = (alpha) => { if (!tCamera || !tControls) return; tCamera.position.lerpVectors(tControls.target, tCamera.position, alpha); tControls.update(); };
-      $("t-zoom-in")?.addEventListener("click", () => zoom(0.8));
-      $("t-zoom-out")?.addEventListener("click", () => zoom(1.25));
-      $("t-rotate")?.addEventListener("click", (e) => { if (!tControls) return; tControls.autoRotate = !tControls.autoRotate; e.currentTarget.textContent = tControls.autoRotate ? "⟳ Stop rotate" : "⟳ Auto-rotate"; });
-      $("t-reset")?.addEventListener("click", () => { if (!tCamera || !tControls) return; tCamera.position.set(0, 170, 210); tControls.target.set(0, 12, 0); tControls.update(); });
+    async function initTiles(p) {
+      const status = $("tiles-status"), wrap = $("tiles-wrap");
+      if (!mapsKey) { status.textContent = "Add a Google key with the Map Tiles API enabled to see the real 3D building."; return; }
+      const key = `${p.lat.toFixed(6)},${p.lng.toFixed(6)}`;
+      if (map3d && tilesKey === key) return; // already showing this home
 
+      try { await loadGoogleMaps(); } catch (e) { status.textContent = "Maps failed to load: " + e.message; return; }
+      let lib;
+      try { lib = await google.maps.importLibrary("maps3d"); }
+      catch (e) { status.textContent = "Photorealistic 3D Maps unavailable. Enable the Map Tiles API on your key. (" + e.message + ")"; return; }
+      const Map3DElement = lib.Map3DElement;
+      const Map3DMode = lib.Map3DMode;
+      if (!Map3DElement) { status.textContent = "Photorealistic 3D Maps not available — enable the Map Tiles API."; return; }
+
+      disposeTiles();
+      tilesKey = key;
+      try {
+        map3d = new Map3DElement({
+          center: { lat: p.lat, lng: p.lng, altitude: 0 },
+          range: 220,        // distance from the home (m)
+          tilt: 67.5,        // look down at an angle
+          heading: 0,
+          mode: Map3DMode ? Map3DMode.HYBRID : undefined,
+        });
+        map3d.style.width = "100%";
+        map3d.style.height = "360px";
+        map3d.style.display = "block";
+        map3d.style.borderRadius = "10px";
+        wrap.innerHTML = "";
+        wrap.appendChild(map3d);
+        status.textContent = "";
+      } catch (e) {
+        status.textContent = "3D Maps error: " + e.message;
+        disposeTiles();
+      }
+    }
+
+    // Zoom / auto-rotate / reset / fullscreen for the 3D Maps panel (wired once).
+    function wireTilesControls() {
+      const setRange = (f) => { if (map3d) map3d.range = Math.min(4000, Math.max(40, (map3d.range || 220) * f)); };
+      $("t-zoom-in")?.addEventListener("click", () => setRange(0.8));
+      $("t-zoom-out")?.addEventListener("click", () => setRange(1.25));
+      $("t-rotate")?.addEventListener("click", (e) => {
+        if (!map3d) return;
+        if (map3dRotate) { clearInterval(map3dRotate); map3dRotate = null; e.currentTarget.textContent = "⟳ Auto-rotate"; }
+        else { map3dRotate = setInterval(() => { if (map3d) map3d.heading = ((map3d.heading || 0) + 0.6) % 360; }, 50); e.currentTarget.textContent = "⟳ Stop rotate"; }
+      });
+      $("t-reset")?.addEventListener("click", () => { if (!map3d) return; map3d.range = 220; map3d.tilt = 67.5; map3d.heading = 0; });
       const wrap = $("tiles-wrap");
       $("t-full")?.addEventListener("click", () => {
         if (!document.fullscreenElement) wrap?.requestFullscreen?.();
         else document.exitFullscreen?.();
       });
-      const resizeTiles = () => {
-        if (!tRenderer || !tCamera) return;
-        const full = document.fullscreenElement === wrap;
-        const w = wrap.clientWidth || 400;
-        const h = full ? (wrap.clientHeight || 360) : 360;
-        tRenderer.setSize(w, h, false);
-        tCamera.aspect = w / h; tCamera.updateProjectionMatrix();
-      };
-      document.addEventListener("fullscreenchange", resizeTiles);
-    }
-
-    function initTiles(p) {
-      const status = $("tiles-status");
-      if (!mapsKey) { status.textContent = "Add a Google key with the Map Tiles API enabled to see the real 3D building."; return; }
-      const key = `${p.lat.toFixed(6)},${p.lng.toFixed(6)}`;
-      if (tiles && tilesKey === key) return; // already showing this location
-      disposeTiles();
-      tilesKey = key;
-
-      try {
-        const canvas = $("tiles3d");
-        const w = canvas.clientWidth || 400, h = 360;
-        tRenderer = new THREE.WebGLRenderer({ canvas, antialias: true });
-        tRenderer.setSize(w, h, false);
-        tRenderer.setPixelRatio(Math.min(devicePixelRatio, 2));
-        tScene = new THREE.Scene();
-        tScene.background = new THREE.Color(0x0b0d11);
-        tCamera = new THREE.PerspectiveCamera(55, w / h, 1, 8000);
-        tCamera.position.set(0, 170, 210);
-        tControls = new OrbitControls(tCamera, canvas);
-        tControls.enableDamping = true;
-        tControls.target.set(0, 12, 0);
-        tControls.minDistance = 35;
-        tControls.maxDistance = 1500;
-        tControls.maxPolarAngle = Math.PI * 0.49; // stay above ground
-        tControls.autoRotateSpeed = 0.8;
-        tScene.add(new THREE.HemisphereLight(0xffffff, 0x404050, 2.2));
-        const dl = new THREE.DirectionalLight(0xffffff, 2.0); dl.position.set(1, 2, 1); tScene.add(dl);
-
-        const draco = new DRACOLoader();
-        draco.setDecoderPath("https://www.gstatic.com/draco/versioned/decoders/1.5.7/");
-
-        tiles = new TilesRenderer();
-        tiles.registerPlugin(new GoogleCloudAuthPlugin({ apiToken: mapsKey, autoRefreshToken: true }));
-        tiles.registerPlugin(new GLTFExtensionsPlugin({ dracoLoader: draco }));
-        tiles.registerPlugin(new TileCompressionPlugin());
-        tiles.registerPlugin(new TilesFadePlugin());
-        tiles.registerPlugin(new ReorientationPlugin({ lat: toRad(p.lat), lon: toRad(p.lng), recenter: true }));
-        tiles.setCamera(tCamera);
-        tiles.setResolutionFromRenderer(tCamera, tRenderer);
-        tScene.add(tiles.group);
-
-        status.textContent = "Loading 3D tiles…";
-        tiles.addEventListener("load-tile-set", () => { status.textContent = ""; });
-        tiles.addEventListener("load-error", () => { status.textContent = "Couldn't load Map Tiles. Enable the Map Tiles API on your key and allow this domain."; });
-
-        (function loop() {
-          tRaf = requestAnimationFrame(loop);
-          if (!tCamera) return;
-          tCamera.updateMatrixWorld();
-          tiles.update();
-          tControls.update();
-          tRenderer.render(tScene, tCamera);
-        })();
-      } catch (e) {
-        status.textContent = "3D tiles error: " + e.message;
-        disposeTiles();
-      }
     }
 
     // -----------------------------------------------------------------------
@@ -878,7 +840,7 @@ export default function Page() {
 
     const onResize = () => {
       if (renderer) { const c = $("view3d"); renderer.setSize(c.clientWidth, 360, false); camera.aspect = c.clientWidth / 360; camera.updateProjectionMatrix(); }
-      if (tRenderer && tCamera) { const c = $("tiles3d"); tRenderer.setSize(c.clientWidth, 360, false); tCamera.aspect = c.clientWidth / 360; tCamera.updateProjectionMatrix(); }
+      // Map3DElement (photorealistic panel) resizes itself.
     };
     window.addEventListener("resize", onResize);
 
