@@ -3,6 +3,8 @@ const nextConfig = {
   // The app uses imperative DOM setup (Google Maps + Three.js), so we keep
   // StrictMode off to avoid double-invoking the one-time init effect in dev.
   reactStrictMode: false,
+  // 3d-tiles-renderer ships untranspiled ESM that imports three/addons.
+  transpilePackages: ["3d-tiles-renderer"],
 };
 
 module.exports = nextConfig;
